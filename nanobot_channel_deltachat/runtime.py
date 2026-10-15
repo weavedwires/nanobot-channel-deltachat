@@ -1,6 +1,7 @@
 """Delta Chat channel implementation using the deltachat-rpc-client SDK."""
 
 import asyncio
+import contextlib
 import shutil
 from pathlib import Path
 from typing import Any, Optional
@@ -138,8 +139,16 @@ class DeltaChatChannel(BaseChannel):
                     logger.warning("DeltaChat аккаунт не инициализирован, завершаем event loop")
                     break
                 event = await asyncio.to_thread(self._account.wait_for_event)
+                # stop() будит поток sentinel'ом (None), а отмена задачи блокирующий
+                # wait_for_event не прерывает — выходим сами, чтобы поток вернулся
+                # в пул и asyncio.run() смог закрыть default executor.
+                if event is None or not self._running:
+                    break
                 await self._handle_event(event)
             except asyncio.CancelledError:
+                # Отмена без stop(): всё равно будим поток, иначе он останется в
+                # queue.get() и повесит завершение default executor.
+                self._wake_event_loop()
                 break
             except Exception as e:
                 logger.error(f"Ошибка в цикле событий DeltaChat: {e}")
@@ -180,7 +189,32 @@ class DeltaChatChannel(BaseChannel):
         elif kind == EventType.ERROR:
             logger.error(self._event_value(event, "msg", str(event)))
 
+    async def stop(self) -> None:
+        """Останавливает канал и освобождает поток, ждущий события.
+
+        ``wait_for_event`` блокирующий (``queue.get()`` без таймаута) и выполняется
+        в потоке ``asyncio.to_thread`` — отменой asyncio-задачи он не прерывается.
+        Без sentinel'а поток навсегда остаётся в ``queue.get()``, а ``asyncio.run()``
+        на выходе ждёт default executor (``THREAD_JOIN_TIMEOUT`` = 300 с): процесс
+        не завершается, и systemd добивает его SIGKILL'ом по ``TimeoutStopSec``
+        (``State 'stop-sigterm' timed out. Killing.``).
+        """
+        self._running = False
         logger.info("Остановка канала DeltaChat...")
+        self._wake_event_loop()
+        await asyncio.sleep(0)
+
+    def _wake_event_loop(self) -> None:
+        """Будит поток, застрявший в ``wait_for_event``: кладёт sentinel в очередь.
+
+        ``Rpc.close()`` дренирует очередь запросов, но не очереди событий аккаунта,
+        поэтому закрытия RPC для выхода из ``wait_for_event`` недостаточно.
+        """
+        rpc, account_id = self._rpc, self._account_id
+        if rpc is None or account_id is None:
+            return
+        with contextlib.suppress(Exception):
+            rpc.get_queue(account_id).put(None)
 
     async def _download_message_media(
         self, msg_id: int, snapshot: Any, *, add_failure_content: bool = False
