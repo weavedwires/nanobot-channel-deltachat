@@ -1,0 +1,40 @@
+# Python bytecode & caches
+*.pyc
+*.pyo
+*.pyd
+*.pyw
+*.pyz
+__pycache__/
+*.egg-info/
+*.egg
+.venv/
+venv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.pytype/
+.dmypy.json
+dmypy.json
+.tox/
+.nox/
+.hypothesis/
+
+# Build & packaging
+dist/
+build/
+pip-wheel-metadata/
+share/python-wheels/
+
+# Test & coverage
+.coverage
+.coverage.*
+htmlcov/
+coverage.xml
+*.cover
+
+# Lock files (project policy — как в апстриме nanobot)
+poetry.lock
+uv.lock
+
+# Прочее
+.DS_Store
