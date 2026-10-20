@@ -15,6 +15,7 @@ Examples
 from __future__ import annotations
 
 import argparse
+import re
 import shutil
 import subprocess
 import sys
@@ -27,9 +28,18 @@ CHANNEL_SRC = REPO_ROOT / "nanobot_channel_deltachat"
 # nanobot's core dependencies so ``uv tool install`` resolves them at build time
 # (the manifest's lazy installer is unreliable inside a uv tool environment).
 DELTACHAT_REQUIREMENTS = (
-    "deltachat-rpc-client>=2.54.0",
-    "deltachat-rpc-server>=2.54.0",
+    "deltachat-rpc-client>=2.63.0,<3.0.0",
+    "deltachat-rpc-server>=2.63.0,<3.0.0",
 )
+
+# Строка зависимости в массиве ``dependencies = [...]`` — нужна, чтобы не только
+# дописывать отсутствующие требования, но и поднимать устаревшие пины.
+_REQ_LINE = re.compile(r'^\s*"(?P<name>[A-Za-z0-9._-]+)(?:\[[^\]]*\])?[^"]*",\s*$')
+
+
+def _req_name(req: str) -> str:
+    """Имя пакета из строки требования (без версии, extras и маркеров)."""
+    return re.split(r"[<>=!~\[; ]", req, maxsplit=1)[0].strip()
 
 _IGNORE_DIRS = {".git", "node_modules", "__pycache__", ".venv", ".mypy_cache", ".ruff_cache", "dist"}
 
@@ -65,22 +75,32 @@ def patch_pyproject(pyproject: Path) -> bool:
     start = text.index(marker)
     close = text.index("\n]", start)
 
-    existing = text[start:close]
-    missing = []
-    for req in DELTACHAT_REQUIREMENTS:
-        name = req.split(">=")[0].split("<")[0].split("==")[0].split("[")[0].strip()
-        if f'"{name}"' in existing or f"'{name}'" in existing:
-            continue
-        missing.append(req)
+    wanted = {_req_name(req): req for req in DELTACHAT_REQUIREMENTS}
+    seen: set[str] = set()
+    changed: list[str] = []
+    lines = []
+    for line in text[start:close].splitlines():
+        match = _REQ_LINE.match(line)
+        name = match.group("name") if match else None
+        if name in wanted:
+            seen.add(name)
+            replacement = f'    "{wanted[name]}",'
+            if replacement != line:
+                changed.append(f"{name} -> {wanted[name]}")
+            line = replacement
+        lines.append(line)
 
-    if not missing:
-        log("dependencies already present in pyproject.toml")
+    added = [req for name, req in wanted.items() if name not in seen]
+    if not changed and not added:
+        log("dependencies already up to date in pyproject.toml")
         return False
 
-    insertion = "\n" + "\n".join(f'    "{req}",' for req in missing)
-    patched = text[:close] + insertion + text[close:]
-    pyproject.write_text(patched, encoding="utf-8")
-    log(f"added dependencies: {', '.join(missing)}")
+    lines.extend(f'    "{req}",' for req in added)
+    pyproject.write_text(text[:start] + "\n".join(lines) + text[close:], encoding="utf-8")
+    if added:
+        log(f"added dependencies: {', '.join(added)}")
+    if changed:
+        log(f"updated dependencies: {', '.join(changed)}")
     return True
 
 

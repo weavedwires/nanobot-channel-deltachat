@@ -27,6 +27,33 @@ STREAM_THROTTLE_S = 2.0
 DOWNLOAD_WAIT_TIMEOUT_S = 30.0
 DOWNLOAD_POLL_INTERVAL_S = 0.25
 
+# Имя бинаря RPC-сервера внутри пакета deltachat_rpc_server.
+RPC_SERVER_BIN_NAME = "deltachat-rpc-server"
+
+
+def resolve_rpc_server_path() -> str:
+    """Возвращает путь к ``deltachat-rpc-server`` из пакета ``deltachat_rpc_server``.
+
+    Бинарь берётся именно из установленного пакета, а не из PATH: в PATH может
+    оказаться сборка другой версии (например, от соседнего бота), и клиент упадёт
+    на методах, которых в ней ещё нет (``-32601 Method not found``).
+    ``deltachat-rpc-server`` — жёсткая зависимость проекта, поэтому установка
+    всегда приносит ядро той же версии, что и клиент.
+    """
+    try:
+        import deltachat_rpc_server as server_pkg  # noqa: PLC0415
+    except ImportError as err:  # pragma: no cover - защита от сломанного окружения
+        raise RuntimeError(
+            "Пакет deltachat-rpc-server не установлен: переустановите nanobot-ai, "
+            "чтобы притянуть ядро Delta Chat как зависимость"
+        ) from err
+
+    bundled = Path(server_pkg.__file__).parent / RPC_SERVER_BIN_NAME
+    if not bundled.is_file():  # pragma: no cover - защита от сломанного окружения
+        raise RuntimeError(f"В пакете deltachat-rpc-server отсутствует бинарь: {bundled}")
+    return str(bundled)
+
+
 # ViewType-значения Delta Chat, которые считаем медиа и передаём в agent.
 _MEDIA_VIEW_TYPES = {
     "Image",
@@ -85,9 +112,16 @@ class DeltaChatChannel(BaseChannel):
                 accounts_dir = Path(self.config.db_dir).expanduser()
             else:
                 accounts_dir = get_runtime_subdir("dc_channel")
-            self._rpc = Rpc(accounts_dir=str(accounts_dir))
+            rpc_server_path = resolve_rpc_server_path()
+            logger.info(f"DeltaChat RPC-сервер: {rpc_server_path}")
+            self._rpc = Rpc(accounts_dir=str(accounts_dir), rpc_server_path=rpc_server_path)
             self._rpc.start()
             self._dc = DeltaChat(self._rpc)
+            try:
+                core_version = self._rpc.get_system_info().get("deltachat_core_version")
+                logger.info(f"DeltaChat ядро: {core_version}")
+            except Exception as version_err:
+                logger.warning(f"Не удалось получить версию ядра DeltaChat: {version_err}")
 
             accounts = self._dc.get_all_accounts()
             self._account = accounts[0] if accounts else self._dc.add_account()
