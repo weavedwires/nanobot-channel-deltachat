@@ -14,6 +14,8 @@ from nanobot.bus.queue import MessageBus
 from nanobot.channels.base import BaseChannel
 from nanobot.config.paths import get_media_dir, get_runtime_subdir
 from nanobot.config.schema import Base
+from nanobot.providers.base import ToolCallRequest
+from nanobot.utils.tool_hints import format_tool_hints
 from pydantic import Field
 
 from .chat_stream import ChatStreamController
@@ -29,6 +31,11 @@ DOWNLOAD_POLL_INTERVAL_S = 0.25
 
 # Имя бинаря RPC-сервера внутри пакета deltachat_rpc_server.
 RPC_SERVER_BIN_NAME = "deltachat-rpc-server"
+
+# Значение ``toolHintMaxLength``, означающее «подсказку не обрезать».
+# Сам форматтер не умеет принимать 0 (обрежет последний символ), поэтому
+# «без лимита» передаётся как заведомо большая длина.
+UNLIMITED_HINT_LENGTH = 100_000
 
 
 def resolve_rpc_server_path() -> str:
@@ -78,6 +85,12 @@ class DeltaChatConfig(Base):
     db_dir: str = ""  # По умолчанию: ~/.nanobot/dc_channel/
     display_name: str = "nanobot"
     streaming: bool = True
+    # Слать ли размышления модели отдельным сообщением.
+    show_reasoning: bool = False
+    # Слать ли подсказки о вызовах инструментов ("$ ls …", "read x").
+    send_tool_hints: bool = True
+    # Длина подсказки о команде; 0 — не обрезать (полная команда).
+    tool_hint_max_length: int = 0
 
 
 class DeltaChatChannel(BaseChannel):
@@ -403,18 +416,53 @@ class DeltaChatChannel(BaseChannel):
             raise RuntimeError("DeltaChat канал не инициализирован")
         return self._stream_controller
 
+    def _hint_max_length(self) -> int:
+        """Длина, с которой канал рендерит подсказку о вызове инструмента."""
+        limit = self.config.tool_hint_max_length
+        return UNLIMITED_HINT_LENGTH if limit <= 0 else limit
+
+    def _render_tool_hint(self, event: ProgressEvent, fallback: str) -> str:
+        """Пересобрать подсказку о вызове инструмента под длину канала.
+
+        ``ProgressEvent.content`` уже обрезан глобальным
+        ``agents.defaults.toolHintMaxLength`` (по умолчанию 40 символов), но
+        в ``tool_events`` лежат полные name/arguments, поэтому подсказку можно
+        отрисовать заново — вплоть до целой команды.
+        """
+        calls = [
+            ToolCallRequest(
+                id=str(payload.get("call_id") or ""),
+                name=str(payload.get("name") or ""),
+                arguments=payload.get("arguments"),
+            )
+            for payload in (event.tool_events or [])
+            if payload.get("phase", "start") == "start" and payload.get("name")
+        ]
+        if not calls:
+            return fallback
+        hint = format_tool_hints(calls, max_length=self._hint_max_length())
+        return hint or fallback
+
     async def send(self, msg: OutboundMessage) -> None:
         controller = self._require_stream_controller()
         event = msg.event
         if isinstance(event, ProgressEvent):
             if event.reasoning or event.reasoning_delta or event.reasoning_end:
                 return
-            kind = "tool" if event.tool_hint else "progress"
+            if event.tool_hint:
+                if not self.config.send_tool_hints:
+                    return
+                kind = "tool"
+                content = self._render_tool_hint(event, msg.content)
+            else:
+                kind = "progress"
+                content = msg.content
         else:
             kind = "answer"
-        if not msg.content:
+            content = msg.content
+        if not content:
             return
-        await controller.on_whole(msg.chat_id, kind, msg.content)
+        await controller.on_whole(msg.chat_id, kind, content)
 
     async def send_delta(
         self,
@@ -441,6 +489,8 @@ class DeltaChatChannel(BaseChannel):
         *,
         stream_id: str | None = None,
     ) -> None:
+        if not self.config.show_reasoning:
+            return
         controller = self._require_stream_controller()
         if delta:
             await controller.on_stream(chat_id, "reasoning", delta)
@@ -452,5 +502,7 @@ class DeltaChatChannel(BaseChannel):
         *,
         stream_id: str | None = None,
     ) -> None:
+        if not self.config.show_reasoning:
+            return
         controller = self._require_stream_controller()
         await controller.on_stream_end(chat_id, "reasoning")
